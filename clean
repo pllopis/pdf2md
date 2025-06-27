@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""clean.py
+Second-stage cleaner: remove running headers, footers and standalone page
+numbers from Markdown that was already extracted in the first pass.
+
+The script uses a *chat* model (Gemini by default) and supports oversized input
+by chunking the document into slices that fit the model context (default
+32 000 tokens ≈ ~128 kB).  Supply your own prompt additions via
+``--prompt-file`` the same way as in **pdf2md.py**.
+
+Quick usage
+~~~~~~~~~~~
+    # Basic clean pass, stdout
+    python clean_md.py draft.md --clean-model gemini-pro
+
+    # Directory of .md files ➜ cleaned single file on disk
+    python clean_md.py ocr_pages/ -o cleaned.md \
+           --prompt-file clean_prompt.txt --chunk-size 65536
+
+Notes on context size
+~~~~~~~~~~~~~~~~~~~~~
+* Gemini models expose the maximum *token* context in their public docs
+  (gemini-pro + gemini-1.5-flash = 30 K tokens, gemini-1.5-pro = 32 K tokens).
+* We take ``--chunk-size`` to mean *tokens*.  In practice we **approximate**
+  one token ≈ 4 characters (English text).  If you need precise token counting
+  you can install ``tiktoken`` or a Gemini-compatible tokenizer and flip the
+  ``--exact-tokenize`` flag.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+# Gemini SDK (google-generativeai)
+try:
+    import google.generativeai as genai  # type: ignore
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit("google-generativeai package missing. Install with 'pip install google-generativeai'.") from exc
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def read_file_if_exists(path: str | Path | None) -> Optional[str]:
+    if not path:
+        return None
+    p = Path(path)
+    if p.is_file():
+        txt = p.read_text(encoding="utf-8").strip()
+        return txt or None
+    return None
+
+
+def read_api_key(path: str = "apikey", env_var: str = "GEMINI_API_KEY") -> str:
+    key = read_file_if_exists(path)
+    if key:
+        return key
+    env = os.getenv(env_var)
+    if env:
+        return env.strip()
+    raise FileNotFoundError(f"No Gemini API key found in '{path}' or ${env_var}.")
+
+
+def default_clean_prompt() -> str:
+    return (
+        """
+        Take this markdown file which contains a digitized book. This book has been digitized page-by-page,
+        but may still contain repeating per-page headers, per-page section markers, or page numbers.
+        The end goal is to have a single continuous book without any per-page information,
+        but keeping real headings and section titles (those that aren't repeating).
+        IMPORTANT: Make sure you remove repeating section headers and line numbers (roman or arabic numerals).
+        Also make sure that sentences aren't split by empty newlines or other markings, make sure the text is continuous.
+        Other than these changes, keep the text verbatim.
+        """
+    )
+
+
+def rough_token_count(text: str) -> int:
+    """Approximate token count (English): 1 token ≈ 4 characters."""
+    return math.ceil(len(text) / 4)
+
+
+def chunk_text(text: str, max_tokens: int) -> List[str]:
+    """Split *text* into chunks <= max_tokens (approx) keeping paragraph boundaries."""
+
+    max_chars = max_tokens * 4  # rough estimate
+    paragraphs = text.split("\n\n")
+    chunks: List[str] = []
+    buf: List[str] = []
+    buf_chars = 0
+
+    for para in paragraphs:
+        para_len = len(para) + 2  # re-add the two newlines removed in split
+        if buf_chars + para_len > max_chars and buf:
+            chunks.append("\n\n".join(buf))
+            buf = [para]
+            buf_chars = para_len
+        else:
+            buf.append(para)
+            buf_chars += para_len
+    if buf:
+        chunks.append("\n\n".join(buf))
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Clean Markdown files from per-page artefacts using a chat-LLM.")
+    p.add_argument("input", help="Path to a .md file or a directory containing .md pages")
+    p.add_argument("-o", "--output", default=None, help="Destination .md file (stdout if omitted)")
+
+    p.add_argument("--clean-model", default="gemini-2.0-flash", help="Gemini model name (default: gemini-2.0-flash)")
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--chunk-size", type=int, default=32768, metavar="TOKENS", help="Max tokens per LLM chunk (approx). Default 32768.")
+    p.add_argument("--prompt-file", default="clean_prompt.txt", help="File with the cleaning prompt instructions. Default clean_prompt.txt")
+    p.add_argument("--no-default-prompt", action="store_true", help="Use prompt-file *only*, skip the built-in cleaner prompt.")
+
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+def main():
+    args = build_parser().parse_args()
+
+    # -- read markdown -----------------------------------------------------
+    in_path = Path(args.input)
+    if not in_path.exists():
+        print("[error] Input does not exist", file=sys.stderr)
+        sys.exit(1)
+
+    if in_path.is_dir():
+        md_files = sorted(in_path.glob("*.md"))
+        if not md_files:
+            print("[error] Directory contains no .md files", file=sys.stderr)
+            sys.exit(1)
+        raw_text = "\n\n".join(fp.read_text("utf-8") for fp in md_files)
+    else:
+        raw_text = in_path.read_text("utf-8")
+
+    # -- chunk if needed ---------------------------------------------------
+    tokens_total = rough_token_count(raw_text)
+    if tokens_total > args.chunk_size:
+        chunks = chunk_text(raw_text, args.chunk_size)
+    else:
+        chunks = [raw_text]
+
+    # -- prepare prompt ----------------------------------------------------
+    extra_prompt = read_file_if_exists(args.prompt_file) or ""
+    base_prompt = "" if args.no_default_prompt else default_clean_prompt()
+    prompt = f"{base_prompt}\n\n{extra_prompt}".strip()
+
+    # -- setup Gemini ------------------------------------------------------
+    api_key = read_api_key()
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(args.clean_model)
+
+    cleaned_chunks: List[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        chat = model.start_chat(history=[{"role": "user", "parts": [prompt]}])
+        print(f"[info] Cleaning chunk {idx}/{len(chunks)} (~{rough_token_count(chunk)} tokens)", file=sys.stderr)
+        resp = chat.send_message(chunk)
+        cleaned_chunks.append(resp.text.strip())
+
+    cleaned_full = "\n\n".join(cleaned_chunks)
+
+    # -- output ------------------------------------------------------------
+    if args.output:
+        Path(args.output).write_text(cleaned_full, "utf-8")
+    else:
+        sys.stdout.write(cleaned_full)
+
+
+if __name__ == "__main__":
+    main()

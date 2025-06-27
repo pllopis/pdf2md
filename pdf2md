@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""pdf2md.py
+Convert a PDF to Markdown using the Vision Parse library (https://github.com/iamarunbrahma/vision-parse).
+
+Example:
+    python pdf2md.py my_paper.pdf -o out.md --detailed --image-mode base64
+
+If you prefer one markdown file per page:
+    python pdf2md.py my_paper.pdf -o output_dir --page-split
+
+The script looks for a file called "apikey" in the current directory or for the
+environment variable GEMINI_API_KEY. Edit the --model argument to switch to
+another Vision-LLM (e.g. gpt-4o, llama3.2-vision:11b, etc.).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import List, Optional
+
+from vision_parse import VisionParser
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def read_api_key(path: str = "apikey", env_var: str = "GEMINI_API_KEY") -> str:
+    """Return the first API key found (file > env var)."""
+
+    key_path = Path(path)
+    if key_path.is_file():
+        return key_path.read_text().strip()
+
+    api_key = os.getenv(env_var)
+    if api_key:
+        return api_key.strip()
+
+    raise FileNotFoundError(
+        f"No API key found. Place a key in '{path}' or set the {env_var} env var.")
+
+
+def read_custom_prompt(path: Optional[str]) -> Optional[str]:
+    """Return the prompt string if *path* exists and has content; else *None*."""
+
+    if not path:
+        return None
+    prompt_path = Path(path)
+    if prompt_path.is_file():
+        text = prompt_path.read_text(encoding="utf-8").strip()
+        return text or None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# CLI parser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Convert a PDF document to Markdown using VisionParse.")
+    p.add_argument("pdf", help="Path to the input PDF file")
+    p.add_argument("-o", "--output", default=None,
+                   help=("Output markdown file or directory (default: stdout). "
+                         "If --page-split is given and OUTPUT is a directory, "
+                         "one file per page is written there."))
+    p.add_argument("-m", "--model", default="gemini-1.5-flash",
+                   help="Vision LLM model name (default: gemini-1.5-flash)")
+    p.add_argument("--image-mode", choices=["url", "base64", "none"],
+                   default="url", help="Embed images as URLs, base64 or skip")
+    p.add_argument("--detailed", action="store_true",
+                   help="Enable advanced extraction (tables, equations, images)")
+    p.add_argument("--concurrency", action="store_true",
+                   help="Parallelise page processing (faster on long PDFs)")
+    p.add_argument("--temperature", type=float, default=0.7,
+                   help="Sampling temperature for the model")
+    p.add_argument("--top-p", type=float, default=0.4,
+                   help="Top‑p nucleus sampling value")
+    p.add_argument("--page-split", action="store_true",
+                   help="Write one markdown file per page. OUTPUT must be a directory.")
+    p.add_argument("--prompt-file", metavar="PATH", default="custom_prompt.txt",
+                   help=("File with extra LLM instructions (default: ./custom_prompt.txt). "
+                         "Set to '' or point to a non‑existent file to skip."))
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Markdown utilities
+# ---------------------------------------------------------------------------
+
+def save_markdown(pages: List[str], output: str | None, page_split: bool):
+    """Write *pages* to disk or stdout."""
+
+    if not output:
+        for i, page in enumerate(pages, 1):
+            print(f"\n--- Page {i} ---\n{page}")
+        return
+
+    out_path = Path(output)
+    if page_split:
+        out_path.mkdir(parents=True, exist_ok=True)
+        for i, page in enumerate(pages, 1):
+            (out_path / f"page_{i:03}.md").write_text(page, encoding="utf-8")
+    else:
+        out_path.write_text("\n\n".join(pages), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Main entry‑point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = build_parser().parse_args()
+
+    api_key = read_api_key()
+    custom_prompt = read_custom_prompt(args.prompt_file)
+
+    vp = VisionParser(
+        model_name=args.model,
+        api_key=api_key,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        image_mode=None if args.image_mode == "none" else args.image_mode,
+        detailed_extraction=args.detailed,
+        enable_concurrency=args.concurrency,
+        custom_prompt=custom_prompt,
+    )
+
+    markdown_pages = vp.convert_pdf(args.pdf)
+    save_markdown(markdown_pages, args.output, args.page_split)
+
+
+if __name__ == "__main__":
+    main()
+
