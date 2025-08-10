@@ -1,48 +1,33 @@
-# OCR-to-Markdown with VLLMs
+# pdf2md
 
-**pdf2md** + **clean_md** is a lightweight, two-stage pipeline that turns **image-scanned PDF books** into clean, re-flowable Markdown using vision-capable large-language models.
+pdf2md converts PDF files into clean, structured Markdown using a Vision LLM.
+It leverages dots.ocr to perform state-of-the-art OCR and layout analysis, preserving headings, paragraphs, tables, and images with high fidelity.
 
----
+Features:
 
-## Why two stages?
-
-| Stage | Script | Purpose |
-|-------|--------|---------|
-| **1** | **`pdf2md`** | Uses a multimodal Vision-LLM (Gemini by default) to *see* each PDF page and emit raw Markdown (one file or one page per file). |
-| **2** | **`clean`** | Feeds that Markdown to a chat-LLM to strip running headers, footers, and page numbers, leaving continuous text ready for Pandoc / Calibre. |
-
-Keeping the passes separate lets you re-clean existing `.md` dumps without re-OCRing the whole book, or swap in a different model for either step.
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/pllopis/pdf2md.git
-cd pdf2md
-python -m venv env && source env/bin/activate
-pip install -r requirements.txt
-```
-
-Add your Gemini API key to a file named apikey in the repo root
-—or set the environment variable GEMINI_API_KEY.
+  *	Checkpoint/restart — resume from partially processed PDFs without losing progress.
+  *	Page range selection — convert only the pages you need.
+  *	Preserves document structure and (optionally) filters out headers/footers.
+  *	Experimental MPS (Apple Silicon) and CPU backends for non-CUDA systems.
 
 ## Quickstart
 
-```bash
-# 1️⃣  Vision-OCR pass
-./pdf2md -o my_scan.md --concurrency my_scan.pdf 
+```
+# 1. Install PyTorch (CUDA 12.8 build)
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 
-# 2️⃣  Cleanup pass
-./clean -o book.md \
-       --clean-model gemini-2.0-flash \
-       my_scan.md
+# 2. Install pdf2md in editable mode
+pip install -e .
 ```
 
-book.md now contains clean Markdown you can convert to EPUB (or anything else) using Calibre or pandoc, e.g.:
+Example
 
-```bash
-pandoc book.md -o book.epub
+```
+pdf2md mydoc.pdf -o mydoc.md
 ```
 
-Happy scanning!
+## Notes
+
+	*	Requires a local or auto-downloaded dots.ocr model (see dots.ocr repo for details).
+	*	On first run, the model will be downloaded to ./weights/DotsOCR unless overridden with --model-dir.
+
